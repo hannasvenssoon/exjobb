@@ -29,7 +29,7 @@
 #define SENSOR_ADDR (0x6B << 1) // I2C-adress
 #define WHO_AM_I_REG 0x0F
 
-I2C_HandleTypeDef hi2c2;
+//I2C_HandleTypeDef hi2c2;
 UART_HandleTypeDef huart1; // För serial output
 
 BSP_MOTION_SENSOR_Axes_t accel;
@@ -126,6 +126,7 @@ void test_sensor()
 }
 
 
+
 /* USER CODE END 0 */
 
 /**
@@ -176,24 +177,48 @@ int main(void)
   	 BSP_MOTION_SENSOR_Init(0, MOTION_ACCELERO);
      BSP_MOTION_SENSOR_Enable(0, MOTION_ACCELERO);
 
+     BSP_MOTION_SENSOR_SetFullScale(0, MOTION_ACCELERO, 4);
+
+
+     int32_t fs;
+     BSP_MOTION_SENSOR_GetFullScale(0, MOTION_ACCELERO, &fs);
+     printf("Full-scale: %ld g\r\n", fs);
+
+     float odr;
+     BSP_MOTION_SENSOR_GetOutputDataRate(0, MOTION_ACCELERO, &odr);
+     printf("ODR before: %.2f Hz \r\n", odr);
+
+     BSP_MOTION_SENSOR_SetOutputDataRate(0, MOTION_ACCELERO, 3330.0f);
+
+     BSP_MOTION_SENSOR_GetOutputDataRate(0, MOTION_ACCELERO, &odr);
+     printf("New ODR: %.2f\r\n", odr);
+
+     printf("I2C2 Timing = 0x%08lX\r\n", hi2c2.Init.Timing);
+
 
   /* USER CODE END 2 */
+     uint32_t start = HAL_GetTick();
+     uint32_t next = start;
+
+     const uint32_t period_ms = 10;
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
     /* USER CODE END WHILE */
-      // Läs accelerometerdata
+	  uint32_t now = HAL_GetTick();
+	  if (now < next)
+		  continue;
+
+	  next += period_ms;
+
       BSP_MOTION_SENSOR_GetAxes(0, MOTION_ACCELERO, &accel);
 
-      // Skicka värden som CSV till Tera Term
       printf("%ld,%ld,%ld\r\n", accel.xval, accel.yval, accel.zval);
 
-      HAL_Delay(2000); // 50 Hz samplingsfrekvens
+      //HAL_Delay();
 	  //test_sensor();
-	  //HAL_Delay(2000);
-
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -394,7 +419,7 @@ static void MX_I2C2_Init(void)
 
   /* USER CODE END I2C2_Init 1 */
   hi2c2.Instance = I2C2;
-  hi2c2.Init.Timing = 0x30909DEC;
+  hi2c2.Init.Timing = 0x00F07BFF;
   hi2c2.Init.OwnAddress1 = 0;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;

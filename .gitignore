@@ -1,0 +1,29 @@
+# Build output
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.srec
+
+# STM32CubeIDE metadata
+.settings/
+.cproject
+.launches/
+*.launch
+.mxproject
+
+# X-CUBE-AI build artifacts
+.ai/build_network/
+
+# Logs / temp
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
