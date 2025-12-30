@@ -18,29 +18,37 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "stm32u5xx_hal.h"
 #include "b_u585i_iot02a_motion_sensors.h"
+#include "ism330dhcx.h"
 
-
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
 #define SENSOR_ADDR (0x6B << 1) // I2C-adress
 #define WHO_AM_I_REG 0x0F
 
 //I2C_HandleTypeDef hi2c2;
 UART_HandleTypeDef huart1; // För serial output
-
+uint64_t unix_start_ms = 0;
 BSP_MOTION_SENSOR_Axes_t accel;
+#define RX_BUF_SIZE 64
 
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-
+static uint8_t uart_rx_char;
+static char uart_rx_buf[RX_BUF_SIZE];
+static uint8_t uart_rx_idx = 0;
+static volatile uint8_t logging_enabled = 0;
+static ISM330DHCX_Object_t acc_obj;
+static uint32_t last_sample_tick = 0;
+static uint8_t current_label = 0;   // 0 = ingen label vald
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
 
 /* USER CODE END PTD */
 
@@ -72,6 +80,59 @@ UART_HandleTypeDef huart1;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
+#define RX_BUF_SIZE 64
+
+//static uint8_t rx_byte;
+//static char rx_buf[RX_BUF_SIZE];
+//static uint8_t rx_idx = 0;
+
+#define ACC_RINGBUFFER_SIZE 2048
+
+typedef struct {
+  int32_t ax;
+  int32_t ay;
+  int32_t az;
+  uint8_t label;
+  uint32_t timestamp;
+} AccSample_t;
+
+typedef struct {
+  AccSample_t buf[ACC_RINGBUFFER_SIZE];
+  uint16_t head;
+  uint16_t tail;
+  uint16_t count;
+  //uint8_t  logging_enabled;
+} AccRingBuffer_t;
+
+static AccRingBuffer_t acc_rb = {0};
+
+static int32_t I2C_ReadReg(uint16_t DevAddr,
+                           uint16_t Reg,
+                           uint8_t *pData,
+                           uint16_t Length)
+{
+  return (HAL_I2C_Mem_Read(&hi2c2,
+                           DevAddr,
+                           Reg,
+                           I2C_MEMADD_SIZE_8BIT,
+                           pData,
+                           Length,
+                           HAL_MAX_DELAY) == HAL_OK) ? 0 : -1;
+}
+
+static int32_t I2C_WriteReg(uint16_t DevAddr,
+                            uint16_t Reg,
+                            uint8_t *pData,
+                            uint16_t Length)
+{
+  return (HAL_I2C_Mem_Write(&hi2c2,
+                            DevAddr,
+                            Reg,
+                            I2C_MEMADD_SIZE_8BIT,
+                            pData,
+                            Length,
+                            HAL_MAX_DELAY) == HAL_OK) ? 0 : -1;
+}
 
 /* USER CODE END PV */
 
@@ -92,6 +153,12 @@ static void MX_UCPD1_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 /* USER CODE BEGIN PFP */
 
+void HandleUartCommand(const char *cmd);
+static void AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts);
+static void AccRB_Clear();
+void AccSamplingThread();
+void Acc_Init(void);
+static void SendBuffer(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -123,6 +190,13 @@ void test_sensor()
     {
         printf("Kommunikationsfel! HAL return code: %d\r\n", ret);
     }
+}
+
+void ReceiveUnixStartTime(void){
+	char buf[32] = {0};
+	HAL_UART_Receive(&huart1, (uint8_t*)buf, sizeof(buf), HAL_MAX_DELAY);
+	unix_start_ms = atoll(buf);
+	//printf("Start unix time: %llu\r\n", unix_start_ms);
 }
 
 
@@ -177,6 +251,8 @@ int main(void)
   	 BSP_MOTION_SENSOR_Init(0, MOTION_ACCELERO);
      BSP_MOTION_SENSOR_Enable(0, MOTION_ACCELERO);
 
+     //ReceiveUnixStartTime();
+
      BSP_MOTION_SENSOR_SetFullScale(0, MOTION_ACCELERO, 4);
 
 
@@ -193,34 +269,50 @@ int main(void)
      BSP_MOTION_SENSOR_GetOutputDataRate(0, MOTION_ACCELERO, &odr);
      printf("New ODR: %.2f\r\n", odr);
 
-     printf("I2C2 Timing = 0x%08lX\r\n", hi2c2.Init.Timing);
+     Acc_Init();
 
+     HAL_UART_Receive_IT(&huart1, &uart_rx_char, 1);
+
+     while (1)
+       {
+    	 if (logging_enabled)
+    	     {
+    	         uint32_t now = HAL_GetTick();
+
+    	         if (now - last_sample_tick >= 1000)   // 1 Hz
+    	         {
+    	             last_sample_tick = now;
+
+    	             //printf("Sampling...\r\n");
+
+    	             // Later:
+    	             //ISM330DHCX_AxesRaw_t axes;
+    	             //ISM330DHCX_ACC_GetAxesRaw(&acc_obj, &axes);
+    	              BSP_MOTION_SENSOR_Axes_t axes;
+    	              BSP_MOTION_SENSOR_GetAxes(0, MOTION_ACCELERO, &axes);
+    	              //printf("Struct: %ld,%ld,%ld\r\n", accel.xval, accel.yval, accel.zval);
+
+    	              AccRB_Push(axes.xval, axes.yval, axes.zval, current_label, now);
+    	              //printf("Struct: %ld, %ld, %ld\r\n", axes.xval, axes.yval, axes.zval);
+
+    	         }
+    	     }
+
+         /* 200 Hz sampling */
+         //tx_thread_sleep(TX_TIMER_TICKS_PER_SECOND / 200);
+         HAL_Delay(5);
+       }
 
   /* USER CODE END 2 */
-     uint32_t start = HAL_GetTick();
-     uint32_t next = start;
-
-     const uint32_t period_ms = 10;
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+  //while (1)
+  //{
     /* USER CODE END WHILE */
-	  uint32_t now = HAL_GetTick();
-	  if (now < next)
-		  continue;
 
-	  next += period_ms;
-
-      BSP_MOTION_SENSOR_GetAxes(0, MOTION_ACCELERO, &accel);
-
-      printf("%ld,%ld,%ld\r\n", accel.xval, accel.yval, accel.zval);
-
-      //HAL_Delay();
-	  //test_sensor();
     /* USER CODE BEGIN 3 */
-  }
+  //}
   /* USER CODE END 3 */
 }
 
@@ -955,7 +1047,209 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
 
+	if (huart->Instance != USART1)
+	  {
+		  //UART1_RestartRx();
+	    return;
+	  }
+
+	  char c = uart_rx_char;
+
+	  // Ignore CR
+	  if (c == '\r')
+	  {
+
+	    HAL_UART_Receive_IT(&huart1, &uart_rx_char, 1);
+		//UART1_RestartRx();
+	    return;
+	  }
+
+	  // End of command
+	  if (c == '\n')
+	  {
+	    uart_rx_buf[uart_rx_idx] = '\0';
+
+	    /* SKICKA VIDARE – INGEN LOGG HÄR */
+	    printf("RX buf: %s\r\n", uart_rx_buf);
+	    HandleUartCommand(uart_rx_buf);
+	    // RESET BUFFER
+		uart_rx_idx = 0;
+		//uart_rx_buf[0] = '\0';
+		memset(uart_rx_buf, 0, sizeof(uart_rx_buf));
+	  }
+	  else
+	  {
+	    if (uart_rx_idx < sizeof(uart_rx_buf) - 1)
+	    {
+	      uart_rx_buf[uart_rx_idx++] = c;
+	      //UART1_RestartRx();
+	    }
+	    else
+	    {
+	      // overflow protection
+	      memset(uart_rx_buf, 0, sizeof(uart_rx_buf));
+	      uart_rx_idx = 0;
+	      //UART1_RestartRx();
+	    }
+	  }
+
+	  // ALWAYS restart RX
+	  HAL_UART_Receive_IT(&huart1, &uart_rx_char, 1);
+}
+
+void HandleUartCommand(const char *cmd)
+{
+  if (strcmp(cmd, "START") == 0)
+  {
+	AccRB_Clear();
+    logging_enabled = 1;
+    printf("OK START\r\n");
+    //AccSamplingThread();
+  }
+  else if (strcmp(cmd, "STOP") == 0)
+  {
+	  logging_enabled = 0;
+    printf("OK STOP\r\n");
+  }
+  else if (strcmp(cmd, "GETDATA") == 0)
+  {
+      printf("OK GETDATA\r\n");
+      SendBuffer();
+  }
+  else if (strncmp(cmd, "LABEL:", 6) == 0)
+  {
+      uint8_t label = (uint8_t)atoi(&cmd[6]);
+      current_label = label;
+
+      printf("OK LABEL %d\r\n", current_label);
+  }
+  else
+  {
+    printf("ERR Unknown command\r\n");
+  }
+}
+
+static void AccRB_Clear(void)
+{
+  acc_rb.head = 0;
+  acc_rb.tail = 0;
+  acc_rb.count = 0;
+}
+
+static void AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts)
+{
+  if (!logging_enabled)
+    return;
+
+  acc_rb.buf[acc_rb.head].ax = ax;
+  acc_rb.buf[acc_rb.head].ay = ay;
+  acc_rb.buf[acc_rb.head].az = az;
+  acc_rb.buf[acc_rb.head].label = label;
+  acc_rb.buf[acc_rb.head].timestamp = ts;
+
+  acc_rb.head = (acc_rb.head + 1) % ACC_RINGBUFFER_SIZE;
+
+  if (acc_rb.count < ACC_RINGBUFFER_SIZE)
+  {
+    acc_rb.count++;
+  }
+  else
+  {
+    acc_rb.tail = (acc_rb.tail + 1) % ACC_RINGBUFFER_SIZE;
+  }
+}
+
+void AccSamplingThread()
+{
+	//ISM330DHCX_AxesRaw_t acc_raw;
+
+ while (1)
+  {
+    if (logging_enabled)
+    {
+    	//SYS_DEBUGF(SYS_DBG_LEVEL_SL, ("[DATALOG] Data accisition started\r\n"));
+    	//if (p_acc)
+    		//{
+    		//SYS_DEBUGF(SYS_DBG_LEVEL_SL, ("[DATALOG] Getting data from sensor\r\n"));
+    	printf("Sampling...\r\n");
+    		/* Läs rådata från ISM330DHCX */
+    	//ISM330DHCX_AxesRaw_t raw;
+    	//ISM330DHCX_ACC_GetAxesRaw(&acc_obj, &raw);
+    	  /* Lägg in i ringbuffer */
+    	//AccRB_Push(raw.x, raw.y, raw.z, HAL_GetTick());;
+
+
+
+
+    		//}
+    }
+    else if(!logging_enabled)
+    {
+    	return;
+    }
+
+    /* 200 Hz sampling */
+    //tx_thread_sleep(TX_TIMER_TICKS_PER_SECOND / 200);
+    HAL_Delay(1000);
+  }
+}
+
+void Acc_Init(void)
+{
+	ISM330DHCX_IO_t io_ctx = {
+	        .BusType  = ISM330DHCX_I2C_BUS,
+	        .Address  = ISM330DHCX_I2C_ADD_L,
+	        .Init     = NULL,
+	        .DeInit   = NULL,
+	        .ReadReg  = I2C_ReadReg,
+	        .WriteReg = I2C_WriteReg,
+	        .GetTick  = (int32_t (*)(void))HAL_GetTick
+	    };
+
+	    ISM330DHCX_RegisterBusIO(&acc_obj, &io_ctx);
+
+	    /* DETTA ÄR KRITISKT */
+	    ISM330DHCX_Init(&acc_obj);
+	    ISM330DHCX_ACC_Enable(&acc_obj);
+
+	    /* Valfritt men rekommenderat */
+	    ISM330DHCX_ACC_SetOutputDataRate(&acc_obj, 200.0f);
+	    ISM330DHCX_ACC_SetFullScale(&acc_obj, 4);
+}
+
+static void SendBuffer(void)
+{
+    printf("DATA BEGIN\r\n");
+
+    uint16_t idx;
+    uint16_t start;
+
+    if (acc_rb.count < ACC_RINGBUFFER_SIZE)
+        start = 0;
+    else
+        start = acc_rb.head;
+
+    for (uint16_t i = 0; i < acc_rb.count; i++)
+    {
+        idx = (start + i) % ACC_RINGBUFFER_SIZE;
+
+        AccSample_t *s = &acc_rb.buf[idx];
+
+        printf("%lu,%ld,%ld,%ld,%d\r\n",
+               s->timestamp,
+               s->ax,
+               s->ay,
+               s->az,
+			   s->label);
+    }
+
+    printf("DATA END\r\n");
+
+    AccRB_Clear();
+}
 /* USER CODE END 4 */
 
 /**
