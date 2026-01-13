@@ -41,9 +41,12 @@ static uint8_t uart_rx_char;
 static char uart_rx_buf[RX_BUF_SIZE];
 static uint8_t uart_rx_idx = 0;
 static volatile uint8_t logging_enabled = 0;
+static volatile uint8_t buffer_full_flag = 0;
+volatile uint8_t stop_requested = 0;
 static ISM330DHCX_Object_t acc_obj;
 static uint32_t last_sample_tick = 0;
 static uint8_t current_label = 0;   // 0 = ingen label vald
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -86,7 +89,7 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 //static char rx_buf[RX_BUF_SIZE];
 //static uint8_t rx_idx = 0;
 
-#define ACC_RINGBUFFER_SIZE 2048
+#define ACC_RINGBUFFER_SIZE 100
 
 typedef struct {
   int32_t ax;
@@ -154,11 +157,12 @@ static void MX_USB_OTG_FS_PCD_Init(void);
 /* USER CODE BEGIN PFP */
 
 void HandleUartCommand(const char *cmd);
-static void AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts);
+static int AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts);
 static void AccRB_Clear();
 void AccSamplingThread();
 void Acc_Init(void);
-static void SendBuffer(void);
+//static void SendBuffer(void);
+static int AccRb_Pop(AccSample_t *s);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -279,7 +283,7 @@ int main(void)
     	     {
     	         uint32_t now = HAL_GetTick();
 
-    	         if (now - last_sample_tick >= 1000)   // 1 Hz
+    	         if (now - last_sample_tick >= 10)   // 100 Hz
     	         {
     	             last_sample_tick = now;
 
@@ -292,15 +296,42 @@ int main(void)
     	              BSP_MOTION_SENSOR_GetAxes(0, MOTION_ACCELERO, &axes);
     	              //printf("Struct: %ld,%ld,%ld\r\n", accel.xval, accel.yval, accel.zval);
 
-    	              AccRB_Push(axes.xval, axes.yval, axes.zval, current_label, now);
+    	              //AccRB_Push(axes.xval, axes.yval, axes.zval, current_label, now);
     	              //printf("Struct: %ld, %ld, %ld\r\n", axes.xval, axes.yval, axes.zval);
 
+    	              if (!AccRB_Push(axes.xval, axes.yval, axes.zval, current_label, now))
+    	              {
+    	            	 logging_enabled = 0;
+    	            	 buffer_full_flag = 1;
+    	            	 printf("Buffer full - sending data\r\n");
+    	              }
     	         }
     	     }
 
+    	 if (buffer_full_flag || stop_requested){
+    		 AccSample_t s;
+
+    		 printf("DATA BEGIN\r\n");
+
+    		 while(AccRb_Pop(&s))
+    		 {
+    			 printf("%lu,%ld,%ld,%ld,%d\r\n",
+    		        s.timestamp,
+					s.ax,
+    			 	s.ay,
+    			 	s.az,
+    			 	s.label);
+
+    		 }
+
+    		 printf("DATA END\r\n");
+    		 buffer_full_flag = 0;
+    		 stop_requested = 0;
+    	 }
+
          /* 200 Hz sampling */
          //tx_thread_sleep(TX_TIMER_TICKS_PER_SECOND / 200);
-         HAL_Delay(5);
+         HAL_Delay(1);
        }
 
   /* USER CODE END 2 */
@@ -1112,13 +1143,14 @@ void HandleUartCommand(const char *cmd)
   else if (strcmp(cmd, "STOP") == 0)
   {
 	  logging_enabled = 0;
+	  stop_requested = 1;
     printf("OK STOP\r\n");
   }
-  else if (strcmp(cmd, "GETDATA") == 0)
+  /*else if (strcmp(cmd, "GETDATA") == 0)
   {
       printf("OK GETDATA\r\n");
       SendBuffer();
-  }
+  }*/
   else if (strncmp(cmd, "LABEL:", 6) == 0)
   {
       uint8_t label = (uint8_t)atoi(&cmd[6]);
@@ -1139,7 +1171,7 @@ static void AccRB_Clear(void)
   acc_rb.count = 0;
 }
 
-static void AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts)
+/*static void AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts)
 {
   if (!logging_enabled)
     return;
@@ -1160,7 +1192,40 @@ static void AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32
   {
     acc_rb.tail = (acc_rb.tail + 1) % ACC_RINGBUFFER_SIZE;
   }
+}*/
+
+static int AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts)
+{
+	if (acc_rb.count >= ACC_RINGBUFFER_SIZE)
+	{
+		return 0;
+	}
+
+	  acc_rb.buf[acc_rb.head].ax = ax;
+	  acc_rb.buf[acc_rb.head].ay = ay;
+	  acc_rb.buf[acc_rb.head].az = az;
+	  acc_rb.buf[acc_rb.head].label = label;
+	  acc_rb.buf[acc_rb.head].timestamp = ts;
+
+	  acc_rb.head = (acc_rb.head +1) % ACC_RINGBUFFER_SIZE;
+	  acc_rb.count++;
+
+	  return 1;
 }
+
+static int AccRb_Pop(AccSample_t *s)
+{
+	if (acc_rb.count == 0)
+		return 0;
+
+
+	*s = acc_rb.buf[acc_rb.tail];
+	acc_rb.tail = (acc_rb.tail +1) % ACC_RINGBUFFER_SIZE;
+	acc_rb.count--;
+
+	return 1;
+}
+
 
 void AccSamplingThread()
 {
@@ -1220,7 +1285,7 @@ void Acc_Init(void)
 	    ISM330DHCX_ACC_SetFullScale(&acc_obj, 4);
 }
 
-static void SendBuffer(void)
+/*static void SendBuffer(void)
 {
     printf("DATA BEGIN\r\n");
 
@@ -1249,8 +1314,30 @@ static void SendBuffer(void)
     printf("DATA END\r\n");
 
     AccRB_Clear();
-}
+}*/
 /* USER CODE END 4 */
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
