@@ -317,7 +317,7 @@ int main(void)
   while (1)
       {
 
-//	  	  HAL_Delay(100);
+	  	//HAL_Delay(20);
 	    /* Läs FIFO när den har tillräckligt med data */
 	    ReadFIFOBlock();
 
@@ -1449,13 +1449,50 @@ void AccSamplingThread()
     ism330dhcx_read_reg(&acc_obj.Ctx, ISM330DHCX_CTRL1_XL, &ctrl1, 1);
     printf("CTRL1_XL after init = 0x%02X\r\n", ctrl1);
 }*/
-static void ISM330DHCX_SensorInit(void)
+/*static void ISM330DHCX_SensorInit(void)
 {
     uint8_t whoami;
 
     dev_ctx.read_reg  = platform_read;
     dev_ctx.write_reg = platform_write;
     dev_ctx.handle    = &hi2c2;
+
+    ism330dhcx_device_id_get(&dev_ctx, &whoami);
+    printf("WHO_AM_I = 0x%02X\r\n", whoami);
+
+     Reset device
+    ism330dhcx_reset_set(&dev_ctx, PROPERTY_ENABLE);
+    HAL_Delay(10);
+
+     Enable block data update
+    ism330dhcx_block_data_update_set(&dev_ctx, PROPERTY_ENABLE);
+
+     Accelerometer config
+    ism330dhcx_xl_full_scale_set(&dev_ctx, ISM330DHCX_2g);
+    ism330dhcx_xl_data_rate_set(&dev_ctx, ISM330DHCX_XL_ODR_3332Hz);
+
+     FIFO setup
+    ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_BYPASS_MODE);
+
+    ism330dhcx_fifo_xl_batch_set(
+        &dev_ctx,
+        ISM330DHCX_XL_BATCHED_AT_3333Hz
+    );
+
+    ism330dhcx_fifo_gy_batch_set(&dev_ctx, ISM330DHCX_GY_NOT_BATCHED);
+
+    ism330dhcx_fifo_watermark_set(&dev_ctx, FIFO_BLOCK_SIZE);
+    ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_STREAM_MODE);
+
+    printf("FIFO configured\r\n");
+}*/
+static void ISM330DHCX_SensorInit(void)
+{
+    uint8_t whoami;
+
+    dev_ctx.read_reg = platform_read;
+    dev_ctx.write_reg = platform_write;
+    dev_ctx.handle = &hi2c2;
 
     ism330dhcx_device_id_get(&dev_ctx, &whoami);
     printf("WHO_AM_I = 0x%02X\r\n", whoami);
@@ -1467,12 +1504,14 @@ static void ISM330DHCX_SensorInit(void)
     /* Enable block data update */
     ism330dhcx_block_data_update_set(&dev_ctx, PROPERTY_ENABLE);
 
+    /* FIFO setup */
+    ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_BYPASS_MODE);
+    ism330dhcx_xl_data_rate_set(&dev_ctx,  ISM330DHCX_XL_ODR_OFF);
     /* Accelerometer config */
     ism330dhcx_xl_full_scale_set(&dev_ctx, ISM330DHCX_2g);
     ism330dhcx_xl_data_rate_set(&dev_ctx, ISM330DHCX_XL_ODR_3332Hz);
 
-    /* FIFO setup */
-    ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_BYPASS_MODE);
+
 
     ism330dhcx_fifo_xl_batch_set(
         &dev_ctx,
@@ -1481,7 +1520,6 @@ static void ISM330DHCX_SensorInit(void)
 
     ism330dhcx_fifo_gy_batch_set(&dev_ctx, ISM330DHCX_GY_NOT_BATCHED);
 
-    ism330dhcx_fifo_watermark_set(&dev_ctx, FIFO_BLOCK_SIZE);
     ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_STREAM_MODE);
 
     printf("FIFO configured\r\n");
@@ -1547,7 +1585,7 @@ static void ReadFIFOBlock(void)
         uint8_t tag = (raw[0] & 0xF8) >> 3;
         //printf("TAG = 0x%02X\r\n", tag);
 
-        //if (tag == ISM330DHCX_XL_NC_TAG)
+        //if (tag == ISM330DHCX_XL_3XC_TAG)
         if (tag != ISM330DHCX_XL_NC_TAG)
         	continue;
         //{
