@@ -34,12 +34,15 @@
 #define WHO_AM_I_REG 0x0F
 #define ISM330DHCX_ADDR  (0x6B << 1)
 
-#define FIFO_BLOCK_SIZE 400
+#define FIFO_THRESHOLD_BLOCK_SIZE 320
 #define MAX_SAMPLES 1024
 #define ISM330DHCX_FIFO_XL_TAG  0x01
+#define FIFO_FRAME_SIZE     7
+#define FIFO_BLOCK_SAMPLES  64      // 32 samples per block read
+#define FIFO_BLOCK_BYTES    (FIFO_FRAME_SIZE * FIFO_BLOCK_SAMPLES)
 
 //I2C_HandleTypeDef hi2c2;
-UART_HandleTypeDef huart1; // För serial output
+//UART_HandleTypeDef huart1; // För serial output
 uint64_t unix_start_ms = 0;
 //BSP_MOTION_SENSOR_Axes_t accel;
 #define RX_BUF_SIZE 64
@@ -48,6 +51,7 @@ static uint8_t uart_rx_char;
 static char uart_rx_buf[RX_BUF_SIZE];
 static uint8_t uart_rx_idx = 0;
 static volatile uint8_t logging_enabled = 0;
+static volatile uint8_t buffer_dump = 0;
 static volatile uint8_t buffer_full_flag = 0;
 volatile uint8_t chunk_flag = 0;
 volatile uint8_t stop_requested = 0;
@@ -55,13 +59,16 @@ static ISM330DHCX_Object_t acc_obj;
 static uint32_t last_sample_tick = 0;
 static uint8_t current_label = 0;   // 0 = ingen label vald
 static uint32_t sample_count = 0;
-static uint32_t sample_t0 = 0;
+static uint32_t t_start = 0;
 static uint16_t fifo_count = 0;
-
+static uint32_t fs_total_samples = 0;
+static uint32_t fs_t0_ms = 0;
 
 static uint16_t sample_index = 0;
 
 static stmdev_ctx_t dev_ctx;
+
+static uint8_t fifo_block[FIFO_BLOCK_BYTES];
 
 /* USER CODE END Includes */
 
@@ -115,6 +122,18 @@ typedef struct {
 	uint32_t timestamp;
 } fifo_sample_t;
 
+/*
+typedef struct {
+    int16_t ax;
+    int16_t ay;
+    int16_t az;
+    uint32_t timestamp;
+} AccSample_t;
+
+static AccSample_t acc_rb[ACC_RINGBUFFER_SIZE];
+static volatile uint32_t rb_head = 0;
+static volatile uint32_t rb_count = 0;
+*/
 typedef struct {
   int32_t ax;
   int32_t ay;
@@ -131,8 +150,11 @@ typedef struct {
   //uint8_t  logging_enabled;
 } AccRingBuffer_t;
 
+//static volatile uint32_t rb_head = 0;
+//static volatile uint32_t rb_count = 0;
+
 static AccRingBuffer_t acc_rb = {0};
-static fifo_sample_t fifo_buf[FIFO_BLOCK_SIZE];
+static fifo_sample_t fifo_buf[FIFO_THRESHOLD_BLOCK_SIZE+1];
 
 /*static int32_t I2C_ReadReg(void *handle, uint8_t Reg,
                            uint8_t *pData, uint16_t Length)
@@ -215,7 +237,8 @@ void AccSamplingThread();
 void Acc_Init(void);
 //static void SendBuffer(void);
 static int AccRb_Pop(AccSample_t *s);
-static void SendFIFO_UART(void);
+static void FifoBuff_Push(int16_t ax, int16_t ay, int16_t az, uint32_t ts);
+static void SendFIFOBuff_UART(void);
 static void ReadFIFOBlock(void);
 static void ISM330DHCX_FIFO_Config(void);
 static void ISM330DHCX_SensorInit(void);
@@ -309,26 +332,32 @@ int main(void)
   MX_USB_OTG_FS_PCD_Init();
 
   printf("BOOT OK\r\n");
+  uint32_t t0 = HAL_GetTick();
+  HAL_Delay(1000);
+  uint32_t t1 = HAL_GetTick();
 
+  printf("Tick delta = %lu\r\n", t1 - t0);
   ISM330DHCX_SensorInit();
+
+  HAL_UART_Receive_IT(&huart1, &uart_rx_char, 1);
   //ISM330DHCX_FIFO_Config();
-  int loop = 0;
+  //int loop = 0;
   /* USER CODE BEGIN 2 */
   while (1)
-      {
+  {
+	  if (logging_enabled)
+	  {
+		  //printf("Collecting...\r\n");
+		  ReadFIFOBlock();
+	  }
 
-	  	//HAL_Delay(20);
-	    /* Läs FIFO när den har tillräckligt med data */
-	    ReadFIFOBlock();
-
-	    /* Om vi faktiskt läste något – skicka det */
-//	    if (fifo_count > 0)
-//	    {
-		SendFIFO_UART();
-		fifo_count = 0;
-////	    }
-	    //loop++;
-      }
+	  if (fifo_count > (FIFO_THRESHOLD_BLOCK_SIZE-1))
+	  {
+		  SendFIFOBuff_UART();
+		  fifo_count = 0;
+	  }
+	  //HAL_Delay(250);
+  }
 /*  	 BSP_MOTION_SENSOR_Init(0, MOTION_ACCELERO);
      BSP_MOTION_SENSOR_Enable(0, MOTION_ACCELERO);
 
@@ -1199,7 +1228,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 	    uart_rx_buf[uart_rx_idx] = '\0';
 
 	    /* SKICKA VIDARE – INGEN LOGG HÄR */
-	    printf("RX buf: %s\r\n", uart_rx_buf);
+	    //printf("RX buf: %s\r\n", uart_rx_buf);
 	    HandleUartCommand(uart_rx_buf);
 	    // RESET BUFFER
 		uart_rx_idx = 0;
@@ -1228,35 +1257,36 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void HandleUartCommand(const char *cmd)
 {
+	//printf("Receive command\r\n");
   if (strcmp(cmd, "START") == 0)
   {
-	AccRB_Clear();
+	//AccRB_Clear();
     logging_enabled = 1;
-    printf("OK START\r\n");
+    //printf("OK START\r\n");
     //AccSamplingThread();
   }
   else if (strcmp(cmd, "STOP") == 0)
   {
 	  logging_enabled = 0;
 	  stop_requested = 1;
-    printf("OK STOP\r\n");
+    //printf("OK STOP\r\n");
   }
   /*else if (strcmp(cmd, "GETDATA") == 0)
   {
       printf("OK GETDATA\r\n");
       SendBuffer();
   }*/
-  else if (strncmp(cmd, "LABEL:", 6) == 0)
+  /*else if (strncmp(cmd, "LABEL:", 6) == 0)
   {
       uint8_t label = (uint8_t)atoi(&cmd[6]);
       current_label = label;
 
-      printf("OK LABEL %d\r\n", current_label);
-  }
-  else
+      //printf("OK LABEL %d\r\n", current_label);
+  }*/
+  /*else
   {
     printf("ERR Unknown command\r\n");
-  }
+  }*/
 }
 
 static void AccRB_Clear(void)
@@ -1289,7 +1319,15 @@ static void AccRB_Clear(void)
   }
 }*/
 
-static int AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts)
+static void FifoBuff_Push(int16_t ax, int16_t ay, int16_t az, uint32_t ts)
+{
+    fifo_buf[fifo_count].ax = ax;
+	fifo_buf[fifo_count].ay = ay;
+	fifo_buf[fifo_count].az = az;
+	fifo_buf[fifo_count].timestamp = ts;
+}
+
+/*static int AccRB_Push_Org(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_t ts)
 {
 	if (acc_rb.count >= ACC_RINGBUFFER_SIZE)
 	{
@@ -1308,7 +1346,7 @@ static int AccRB_Push(int32_t ax, int32_t ay, int32_t az, uint8_t label, uint32_
 	  return 1;
 }
 
-static int AccRb_Pop(AccSample_t *s)
+static int AccRb_Pop_Org(AccSample_t *s)
 {
 	if (acc_rb.count == 0)
 		return 0;
@@ -1319,7 +1357,7 @@ static int AccRb_Pop(AccSample_t *s)
 	acc_rb.count--;
 
 	return 1;
-}
+}*/
 
 
 void AccSamplingThread()
@@ -1460,69 +1498,66 @@ void AccSamplingThread()
     ism330dhcx_device_id_get(&dev_ctx, &whoami);
     printf("WHO_AM_I = 0x%02X\r\n", whoami);
 
-     Reset device
-    ism330dhcx_reset_set(&dev_ctx, PROPERTY_ENABLE);
+     Reset FIFO
+    ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_BYPASS_MODE);
     HAL_Delay(10);
 
-     Enable block data update
-    ism330dhcx_block_data_update_set(&dev_ctx, PROPERTY_ENABLE);
+     Disable gyroscope
+    ism330dhcx_gy_data_rate_set(&dev_ctx, ISM330DHCX_GY_ODR_OFF);
 
-     Accelerometer config
-    ism330dhcx_xl_full_scale_set(&dev_ctx, ISM330DHCX_2g);
-    ism330dhcx_xl_data_rate_set(&dev_ctx, ISM330DHCX_XL_ODR_3332Hz);
-
-     FIFO setup
-    ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_BYPASS_MODE);
-
-    ism330dhcx_fifo_xl_batch_set(
-        &dev_ctx,
-        ISM330DHCX_XL_BATCHED_AT_3333Hz
-    );
-
+     Disable gyro batching
     ism330dhcx_fifo_gy_batch_set(&dev_ctx, ISM330DHCX_GY_NOT_BATCHED);
 
-    ism330dhcx_fifo_watermark_set(&dev_ctx, FIFO_BLOCK_SIZE);
-    ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_STREAM_MODE);
+     Disable temperature batching
+    ism330dhcx_fifo_temp_batch_set(&dev_ctx, ISM330DHCX_TEMP_NOT_BATCHED);
+
+
+     Enable accelerometer
+    ism330dhcx_xl_data_rate_set(&dev_ctx, ISM330DHCX_XL_ODR_3332Hz);
+    ism330dhcx_xl_full_scale_set(&dev_ctx, ISM330DHCX_4g);
+
+     Batch ONLY accelerometer into FIFO
+    ism330dhcx_fifo_xl_batch_set(&dev_ctx, ISM330DHCX_XL_BATCHED_AT_3333Hz);
+
+     Set FIFO to stream mode
+    ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_FIFO_MODE);
 
     printf("FIFO configured\r\n");
 }*/
 static void ISM330DHCX_SensorInit(void)
 {
     uint8_t whoami;
+    uint8_t rst;
 
-    dev_ctx.read_reg = platform_read;
+    dev_ctx.read_reg  = platform_read;
     dev_ctx.write_reg = platform_write;
-    dev_ctx.handle = &hi2c2;
+    dev_ctx.handle    = &hi2c2;
 
     ism330dhcx_device_id_get(&dev_ctx, &whoami);
-    printf("WHO_AM_I = 0x%02X\r\n", whoami);
 
-    /* Reset device */
+    /* Reset once*/
     ism330dhcx_reset_set(&dev_ctx, PROPERTY_ENABLE);
-    HAL_Delay(10);
+    //HAL_Delay(10);
+    do {
+            ism330dhcx_reset_get(&dev_ctx, &rst);
+        } while (rst);
 
-    /* Enable block data update */
-    ism330dhcx_block_data_update_set(&dev_ctx, PROPERTY_ENABLE);
-
-    /* FIFO setup */
     ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_BYPASS_MODE);
-    ism330dhcx_xl_data_rate_set(&dev_ctx,  ISM330DHCX_XL_ODR_OFF);
-    /* Accelerometer config */
-    ism330dhcx_xl_full_scale_set(&dev_ctx, ISM330DHCX_2g);
+
+    /* Disable everything first */
+    ism330dhcx_xl_data_rate_set(&dev_ctx, ISM330DHCX_XL_ODR_OFF);
+    ism330dhcx_gy_data_rate_set(&dev_ctx, ISM330DHCX_GY_ODR_OFF);
+
+    /* Configure accelerometer */
+    ism330dhcx_xl_full_scale_set(&dev_ctx, ISM330DHCX_4g);
     ism330dhcx_xl_data_rate_set(&dev_ctx, ISM330DHCX_XL_ODR_3332Hz);
 
-
-
-    ism330dhcx_fifo_xl_batch_set(
-        &dev_ctx,
-        ISM330DHCX_XL_BATCHED_AT_3333Hz
-    );
-
+    /* FIFO */
+    //ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_BYPASS_MODE);
+    ism330dhcx_fifo_xl_batch_set(&dev_ctx, ISM330DHCX_XL_BATCHED_AT_3333Hz);
     ism330dhcx_fifo_gy_batch_set(&dev_ctx, ISM330DHCX_GY_NOT_BATCHED);
-
+    //ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_FIFO_MODE);
     ism330dhcx_fifo_mode_set(&dev_ctx, ISM330DHCX_STREAM_MODE);
-
-    printf("FIFO configured\r\n");
 }
 
 
@@ -1562,18 +1597,88 @@ static void ISM330DHCX_FIFO_Config(void)
 
     printf("FIFO configured\r\n");
 }
-
 static void ReadFIFOBlock(void)
+{
+    uint16_t fifo_level;
+    uint16_t fifo_buff_level = 0;
+    ism330dhcx_fifo_data_level_get(&dev_ctx, &fifo_level);
+    printf("Fifo level %d\r\n", fifo_level);
+    if (fifo_level < FIFO_THRESHOLD_BLOCK_SIZE) //Wait until sensor FIFO queue reached threshold, before emtying buffer
+           return;
+
+    //while (fifo_level > 0)
+    //{
+    //for (uint16_t l = 0; l < FIFO_THRESHOLD_BLOCK_SIZE; l++)
+    //{
+    while (fifo_count < FIFO_THRESHOLD_BLOCK_SIZE)
+    {
+        uint16_t samples_to_read =
+            (fifo_level > FIFO_BLOCK_SAMPLES) ?
+            FIFO_BLOCK_SAMPLES : fifo_level;
+
+        uint16_t bytes = samples_to_read * FIFO_FRAME_SIZE;
+        //printf("Samples to read %d\r\n", samples_to_read);
+        //BLOCK READ: EN I2C-TRANSAKTION
+        platform_read(
+            dev_ctx.handle,
+            ISM330DHCX_FIFO_DATA_OUT_TAG,
+            fifo_block,
+            bytes
+        );
+
+        //Process block
+        for (uint16_t i = 0; i < samples_to_read; i++)
+        {
+            uint8_t *sample = &fifo_block[i * FIFO_FRAME_SIZE];
+
+            uint8_t tag = (sample[0] & 0xF8) >> 3;
+            if (tag != ISM330DHCX_XL_NC_TAG)
+                continue;
+
+            int16_t ax = (int16_t)(sample[2] << 8 | sample[1]);
+            int16_t ay = (int16_t)(sample[4] << 8 | sample[3]);
+            int16_t az = (int16_t)(sample[6] << 8 | sample[5]);
+
+            FifoBuff_Push(ax, ay, az, HAL_GetTick());
+
+            fifo_count++;
+            fs_total_samples++;
+        }
+
+        fifo_level -= samples_to_read;
+        fifo_buff_level += samples_to_read;
+        //printf("Fifobuff level %d\r\n", fifo_buff_level);
+        //printf("Fifo count %d\r\n", fifo_count);
+
+        if (fs_t0_ms == 0)
+		{
+			fs_t0_ms = HAL_GetTick();
+		}
+
+		//fs_total_samples += fifo_count;
+
+		uint32_t now = HAL_GetTick();
+		if (now - fs_t0_ms >= 5000)   // 5 sek fönster
+		{
+			float fs = fs_total_samples / 5.0f;
+			printf("Measured sampling frequency: %.1f Hz\r\n", fs);
+
+			fs_total_samples = 0;
+			fs_t0_ms = now;
+		}
+   }
+}
+/*static void ReadFIFOBlock(void)
 {
 	//printf("Read fifo block\r\n");
     uint16_t level;
     ism330dhcx_fifo_data_level_get(&dev_ctx, &level);
-    printf("Fifo level %d\r\n", level);
+    //printf("Fifo level %d\r\n", level);
 
-//    if (level < FIFO_BLOCK_SIZE)
-//        return;
+    if (level < FIFO_THRESHOLD_BLOCK_SIZE)
+       return;
 
-    fifo_count = 0;
+    //fifo_count = 0;
     //printf("Before for...\r\n");
     for (uint16_t i = 0; i < level; i++)
     {
@@ -1585,9 +1690,10 @@ static void ReadFIFOBlock(void)
         uint8_t tag = (raw[0] & 0xF8) >> 3;
         //printf("TAG = 0x%02X\r\n", tag);
 
-        //if (tag == ISM330DHCX_XL_3XC_TAG)
+        //if (tag != ISM330DHCX_XL_3XC_TAG)
         if (tag != ISM330DHCX_XL_NC_TAG)
         	continue;
+        FifoBuff_Push((int16_t)(raw[2] << 8 | raw[1]), (int16_t)(raw[4] << 8 | raw[3]), (int16_t)(raw[6] << 8 | raw[5]), HAL_GetTick());
         //{
         	//printf("Buffering...\r\n");
 		fifo_buf[fifo_count].ax =
@@ -1601,26 +1707,30 @@ static void ReadFIFOBlock(void)
 		fifo_count++;
         //}
 
-        /*else
-        {
-        	//printf("Other tag...\r\n");
-             discard non-accelerometer samples
-            uint8_t dummy[2];
-            ism330dhcx_read_reg(
-                &acc_obj.Ctx,
-                ISM330DHCX_FIFO_DATA_OUT_X_L,
-                dummy,
-                2
-            );
-        }*/
+	    if (fs_t0_ms == 0)
+	    {
+	        fs_t0_ms = HAL_GetTick();
+	    }
+
+	    fs_total_samples += fifo_count;
+
+	    uint32_t now = HAL_GetTick();
+	    if (now - fs_t0_ms >= 5000)   // 5 sek fönster
+	    {
+	        float fs = fs_total_samples / 5.0f;
+	        printf("Measured sampling frequency: %.1f Hz\r\n", fs);
+
+	        fs_total_samples = 0;
+	        fs_t0_ms = now;
+	    }
 
     }
 	//printf("exit fifo block\r\n");
-}
+}*/
 
-static void SendFIFO_UART(void)
+static void SendFIFOBuff_UART(void)
 {
-    printf("DATA BEGIN\r\n");
+    //printf("DATA BEGIN\r\n");
 
     for (uint16_t i = 0; i < fifo_count; i++)
     {
@@ -1631,8 +1741,9 @@ static void SendFIFO_UART(void)
                fifo_buf[i].az);
     }
 
-    printf("DATA END\r\n");
+    //printf("DATA END\r\n");
 }
+
 
 /* USER CODE END 4 */
 
